@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "60534378033",
+    "project_id": "mat-than-ai",
+    "storage_bucket": "mat-than-ai.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:60534378033:android:315d74bb3a72c1cfc48f10",
+        "android_client_info": {
+          "package_name": "com.example.mat_ai_pro"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDpxn-DtTEnNkfMIrXWbKInLyH_jWiuLIo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
