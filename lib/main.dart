@@ -587,6 +587,26 @@ class _YoloScreenState extends State<YoloScreen> {
     
     if (mounted) {
       screenSize = MediaQuery.of(context).size;
+      // --- PHẦN MỚI: GỬI DỮ LIỆU LÊN FIREBASE ---
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null && result.isNotEmpty) {
+        // Lấy vị trí hiện tại của thiết bị
+        Position position = await Geolocator.getCurrentPosition();
+
+        for (var detection in result) {
+          // Chỉ gửi lên nếu độ tự tin > 0.6 (Tránh rác dữ liệu)
+          if ((detection['box'][4] ?? 0.0) > 0.6) {
+            FirebaseFirestore.instance.collection('detections').add({
+              'user_id': user.uid,
+              'detected_object': detection['tag'],     // Tên vật cản
+              'confidence_score': detection['box'][4], // Độ tự tin
+              'latitude': position.latitude,           // Vĩ độ thật
+              'longitude': position.longitude,         // Kinh độ thật
+              'timestamp': FieldValue.serverTimestamp(),
+            });
+          }
+        }
+      }
       if (result.isEmpty) lastSpokenTag = ""; 
 
       setState(() {
@@ -950,43 +970,8 @@ class TrackingScreen extends StatefulWidget {
 
 class _TrackingScreenState extends State<TrackingScreen> {
   final MapController _mapController = MapController();
-  LatLng? _currentLocation; // Vị trí hiện tại của người khiếm thị
+  LatLng? _currentLocation; 
   bool _isFirstLoad = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _listenToLocation();
-  }
-
-  // Hàm lắng nghe dữ liệu từ Firebase
-  void _listenToLocation() {
-    // 1. Tìm trong danh sách users xem ai có tên giống targetName
-    FirebaseFirestore.instance
-        .collection('users')
-        .where('username', isEqualTo: widget.targetName)
-        .limit(1) // Chỉ lấy 1 người
-        .snapshots() // Lắng nghe liên tục (Real-time)
-        .listen((snapshot) {
-      if (snapshot.docs.isNotEmpty) {
-        var data = snapshot.docs.first.data();
-        if (data['location'] != null) {
-          double lat = data['location']['lat'];
-          double lng = data['location']['lng'];
-
-          setState(() {
-            _currentLocation = LatLng(lat, lng);
-          });
-
-          // Di chuyển camera đến vị trí mới (chỉ lần đầu hoặc khi bấm nút)
-          if (_isFirstLoad) {
-            _mapController.move(_currentLocation!, 15);
-            _isFirstLoad = false;
-          }
-        }
-      }
-    });
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -995,42 +980,87 @@ class _TrackingScreenState extends State<TrackingScreen> {
         title: Text("Đang theo dõi: ${widget.targetName}"),
         backgroundColor: Colors.blue[900],
       ),
-      body: _currentLocation == null
-          ? const Center(child: CircularProgressIndicator()) // Đang tải...
-          : FlutterMap(
-              mapController: _mapController,
-              options: MapOptions(
-                initialCenter: _currentLocation!, // Vị trí ban đầu
-                initialZoom: 15.0, // Độ phóng to
-              ),
-              children: [
-                // 1. Lớp nền bản đồ (OpenStreetMap)
-                TileLayer(
-                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                  userAgentPackageName: 'com.example.mat_ai_pro',
-                ),
-                // 2. Lớp Marker (Vị trí người thân)
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: _currentLocation!,
-                      width: 80,
-                      height: 80,
-                      child: const Column(
-                        children: [
-                          Icon(Icons.location_on, color: Colors.red, size: 40),
-                          Text("Ở đây!", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-              ],
+      // Dùng StreamBuilder truy vấn chuẩn vào bảng 'users' của bạn
+      body: StreamBuilder<QuerySnapshot>(
+        stream: FirebaseFirestore.instance
+            .collection('users')
+            .where('username', isEqualTo: widget.targetName)
+            .limit(1)
+            .snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.connectionState == ConnectionState.waiting && _isFirstLoad) {
+            return const Center(child: CircularProgressIndicator()); // Quay tròn chờ tải
+          }
+
+          if (snapshot.hasError) {
+            return const Center(child: Text('Có lỗi xảy ra khi kết nối.'));
+          }
+
+          if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+            return const Center(
+              child: Text('Không tìm thấy người dùng này hoặc họ chưa bật App.', 
+              style: TextStyle(color: Colors.red, fontSize: 16)),
+            );
+          }
+
+          // Lấy dữ liệu từ Firebase
+          var data = snapshot.data!.docs.first.data() as Map<String, dynamic>;
+          
+          if (data['location'] == null) {
+             return const Center(
+               child: Text('Người dùng này chưa cập nhật vị trí GPS.',
+               style: TextStyle(color: Colors.red, fontSize: 16)),
+             );
+          }
+
+          // Lấy đúng cấu trúc dữ liệu location['lat'] và location['lng'] của bạn
+          double lat = data['location']['lat'];
+          double lng = data['location']['lng'];
+
+          _currentLocation = LatLng(lat, lng);
+
+          // Cập nhật camera đi theo vị trí mới
+          if (!_isFirstLoad) {
+            _mapController.move(_currentLocation!, 16.0);
+          }
+          _isFirstLoad = false;
+
+          // VẼ BẢN ĐỒ MIỄN PHÍ
+          return FlutterMap(
+            mapController: _mapController,
+            options: MapOptions(
+              initialCenter: _currentLocation!,
+              initialZoom: 16.0, // Phóng to vừa phải
             ),
+            children: [
+              TileLayer(
+                urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+userAgentPackageName: 'com.example.mat_ai_pro',
+              ),
+              MarkerLayer(
+                markers: [
+                  Marker(
+                    point: _currentLocation!,
+                    width: 80,
+                    height: 80,
+                    child: const Column(
+                      children: [
+                        Icon(Icons.location_on, color: Colors.red, size: 40),
+                        Text("Ở đây!", style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          );
+        },
+      ),
+      // Nút bấm góc dưới để camera nhảy về đúng vị trí người đó
       floatingActionButton: FloatingActionButton(
         onPressed: () {
           if (_currentLocation != null) {
-            _mapController.move(_currentLocation!, 15); // Quay về vị trí
+            _mapController.move(_currentLocation!, 16);
           }
         },
         backgroundColor: Colors.blue[900],
