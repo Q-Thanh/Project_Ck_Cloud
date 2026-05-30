@@ -15,6 +15,7 @@ import 'package:sensors_plus/sensors_plus.dart'; // Import cảm biến gia tố
 import 'dart:math' as math;                  // Import toán học
 import 'depth_anything_helper.dart';        // Import helper đo khoảng cách AI mới
 import 'admin_screen.dart';
+import 'object_tracker.dart';
 late List<CameraDescription> _cameras;
 
 Future<void> main() async {
@@ -495,6 +496,7 @@ class _YoloScreenState extends State<YoloScreen> {
   bool isPaused = false;
   bool isEcoMode = false;
 
+  final ObjectTracker tracker = ObjectTracker();
   List<Map<String, dynamic>> yoloResults = [];
   CameraImage? cameraImage;
   int frameCounter = 0;
@@ -604,41 +606,64 @@ class _YoloScreenState extends State<YoloScreen> {
     
     if (mounted) {
       screenSize = MediaQuery.of(context).size;
-      // --- PHẦN MỚI: GỬI DỮ LIỆU LÊN FIREBASE ---
-      final user = FirebaseAuth.instance.currentUser;
-      if (user != null && result.isNotEmpty) {
-        // Lấy vị trí hiện tại của thiết bị
-        Position position = await Geolocator.getCurrentPosition();
 
-        for (var detection in result) {
-          // Chỉ gửi lên nếu độ tự tin > 0.6 (Tránh rác dữ liệu)
-          if ((detection['box'][4] ?? 0.0) > 0.6) {
-            FirebaseFirestore.instance.collection('detections').add({
-              'user_id': user.uid,
-              'detected_object': detection['tag'],     // Tên vật cản
-              'confidence_score': detection['box'][4], // Độ tự tin
-              'latitude': position.latitude,           // Vĩ độ thật
-              'longitude': position.longitude,         // Kinh độ thật
-              'timestamp': FieldValue.serverTimestamp(),
-            });
+      // Chuyển sang dạng Map thay đổi được để gán tracker_id
+      final mutableResult = result.map((e) => Map<String, dynamic>.from(e)).toList();
+      tracker.update(mutableResult);
+
+      // --- PHẦN MỚI: GỬI DỮ LIỆU LÊN FIREBASE (CHỈ GỬI VẬT THỂ MỚI) ---
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null && mutableResult.isNotEmpty) {
+        Position? position;
+
+        for (var detection in mutableResult) {
+          double confidence = detection['box'][4] ?? 0.0;
+          if (confidence > 0.6) {
+            String? trackerId = detection['tracker_id'];
+            if (trackerId != null) {
+              var trackedObj = tracker.find(trackerId);
+              if (trackedObj != null && !trackedObj.isUploaded) {
+                // Lấy vị trí GPS một lần duy nhất trong frame nếu có vật thể mới cần gửi
+                position ??= await Geolocator.getCurrentPosition();
+                
+                FirebaseFirestore.instance.collection('detections').add({
+                  'user_id': user.uid,
+                  'detected_object': detection['tag'],     // Tên vật cản
+                  'confidence_score': confidence,          // Độ tự tin
+                  'latitude': position.latitude,           // Vĩ độ thật
+                  'longitude': position.longitude,         // Kinh độ thật
+                  'timestamp': FieldValue.serverTimestamp(),
+                });
+                
+                trackedObj.isUploaded = true;
+              }
+            }
           }
         }
       }
-      if (result.isEmpty) lastSpokenTag = ""; 
+      if (mutableResult.isEmpty) lastSpokenTag = ""; 
 
       setState(() {
-        yoloResults = result;
-        for (var detection in result) {
-           if ((detection['box'][4] ?? 0.0) > 0.6) {
-             detectionHistory.insert(0, {'tag': detection['tag'], 'timestamp': DateTime.now()});
-             if (detectionHistory.length > 50) detectionHistory.removeLast();
+        yoloResults = mutableResult;
+        for (var detection in mutableResult) {
+           double confidence = detection['box'][4] ?? 0.0;
+           if (confidence > 0.6) {
+             String? trackerId = detection['tracker_id'];
+             if (trackerId != null) {
+               var trackedObj = tracker.find(trackerId);
+               if (trackedObj != null && !trackedObj.isAddedToHistory) {
+                 detectionHistory.insert(0, {'tag': detection['tag'], 'timestamp': DateTime.now()});
+                 trackedObj.isAddedToHistory = true;
+                 if (detectionHistory.length > 50) detectionHistory.removeLast();
+               }
+             }
            }
         }
         isDetecting = false;
       });
 
       if (screenSize != null) {
-        processVoiceSmart(result, screenSize!);
+        processVoiceSmart(mutableResult, screenSize!);
       }
     }
   }
@@ -705,7 +730,38 @@ class _YoloScreenState extends State<YoloScreen> {
 
     if (priorityObj != null) {
       String tag = priorityObj['tag'];
-      if (tag == lastSpokenTag) return; 
+      String? trackerId = priorityObj['tracker_id'];
+
+      if (trackerId != null) {
+        var trackedObj = tracker.find(trackerId);
+        if (trackedObj != null) {
+          bool shouldSpeak = false;
+          if (priorityStatus == "DANGER") {
+            // Cảnh báo nguy hiểm: Phát lại sau mỗi 5 giây nếu vẫn nguy hiểm
+            if (!trackedObj.isSpoken || 
+                trackedObj.lastSpokenDistance != "DANGER" || 
+                DateTime.now().difference(trackedObj.lastSpokenTime) > const Duration(seconds: 5)) {
+              shouldSpeak = true;
+            }
+          } else {
+            // Cảnh báo bình thường: Chỉ phát khi phát hiện lần đầu hoặc sau mỗi 15 giây
+            if (!trackedObj.isSpoken || 
+                DateTime.now().difference(trackedObj.lastSpokenTime) > const Duration(seconds: 15)) {
+              shouldSpeak = true;
+            }
+          }
+
+          if (!shouldSpeak) return;
+
+          // Cập nhật trạng thái
+          trackedObj.isSpoken = true;
+          trackedObj.lastSpokenDistance = priorityStatus;
+          trackedObj.lastSpokenTime = DateTime.now();
+        }
+      } else {
+        // Dự phòng nếu không có tracking ID
+        if (tag == lastSpokenTag) return;
+      }
 
       dynamic box = priorityObj["box"];
       double x1 = box[0]; double x2 = box[2];
@@ -763,6 +819,7 @@ class _YoloScreenState extends State<YoloScreen> {
       if (!isPaused) {
         yoloResults.clear();
         lastSpokenTag = "";
+        tracker.clear();
       }
     });
   }
@@ -881,6 +938,7 @@ class _YoloScreenState extends State<YoloScreen> {
 
   @override
   void dispose() {
+    tracker.clear();
     _depthHelper.close();
     _accelSubscription?.cancel();
     _lightSensorSubscription?.cancel();
@@ -1027,7 +1085,9 @@ class _YoloScreenState extends State<YoloScreen> {
         image: cameraImage,
       );
       Color boxColor = distance.contains("Rất gần") ? Colors.redAccent : Colors.cyanAccent;
-      String vnName = dictionary[tag] ?? tag;
+      
+      String trackerIdSuffix = result['tracker_id'] != null ? " #${result['tracker_id'].split('_').last}" : "";
+      String vnName = "${dictionary[tag] ?? tag}$trackerIdSuffix";
 
       double centerX = (x1 + x2) / 2;
       String posStr = "";
