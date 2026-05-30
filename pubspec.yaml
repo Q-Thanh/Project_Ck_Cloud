@@ -35,6 +35,7 @@ dependencies:
   flutter_vision: 1.1.3
   flutter_tts: ^3.8.5
   light_sensor: ^3.0.2   # Để đo ánh sáng môi trường
+  sensors_plus: ^6.1.1   # Để đo góc nghiêng động của thiết bị
   #tflite_flutter: ^0.12.0
   cupertino_icons: ^1.0.8
   firebase_auth: ^6.1.4
