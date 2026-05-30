@@ -11,6 +11,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter_map/flutter_map.dart'; // Import bản đồ
 import 'package:latlong2/latlong.dart';       // Import tọa độ
+import 'package:sensors_plus/sensors_plus.dart'; // Import cảm biến gia tốc
+import 'dart:math' as math;                  // Import toán học
 import 'admin_screen.dart';
 late List<CameraDescription> _cameras;
 
@@ -485,6 +487,8 @@ class _YoloScreenState extends State<YoloScreen> {
   bool isFlashOn = false;
   bool isAutoFlash = false;
   StreamSubscription<int>? _lightSensorSubscription;
+  double _currentPitchRad = 15.0 * math.pi / 180.0; // Mặc định 15 độ cúi xuống
+  StreamSubscription<AccelerometerEvent>? _accelSubscription;
 
   bool isPaused = false;
   bool isEcoMode = false;
@@ -553,6 +557,16 @@ class _YoloScreenState extends State<YoloScreen> {
         yoloOnFrame(image);
       }
     });
+
+    // Lắng nghe cảm biến gia tốc để cập nhật góc nghiêng động
+    _accelSubscription = accelerometerEventStream().listen((AccelerometerEvent event) {
+      double pitch = math.atan2(event.z, -event.y);
+      // Giới hạn góc nghiêng hợp lệ từ -45 độ đến 75 độ
+      if (pitch > -math.pi / 4 && pitch < 5 * math.pi / 12) {
+        _currentPitchRad = pitch;
+      }
+    });
+
     _startSharingLocation();
   }
 
@@ -641,8 +655,9 @@ class _YoloScreenState extends State<YoloScreen> {
       double y1 = box[1]; double y2 = box[3];
       if (box[2] < 2.0) { y1 *= imageHeight; y2 *= imageHeight; }
       
+      double finalBottom = y2 * scaleY;
       double finalHeight = (y2 - y1) * scaleY;
-      String distText = estimateDistance(finalHeight, screen.height, result['tag']);
+      String distText = estimateDistance(finalBottom, finalHeight, screen.height, result['tag']);
 
       if (distText.contains("Rất gần")) {
         priorityObj = result;
@@ -760,21 +775,65 @@ class _YoloScreenState extends State<YoloScreen> {
     );
   }
 
-  String estimateDistance(double boxHeight, double screenHeight, String label) {
-    double ratio = boxHeight / screenHeight; 
-    double factor = 1.0;
-    if (['person', 'door', 'refrigerator'].contains(label)) factor = 0.75; 
-    else if (['cup', 'bottle', 'phone', 'mouse'].contains(label)) factor = 0.15; 
-    else if (['tv', 'monitor', 'laptop'].contains(label)) factor = 0.6; 
-    else factor = 0.55;
+  // Bảng chiều cao thực tế của các vật thể phổ biến (mét)
+  static const Map<String, double> _realHeights = {
+    'person': 1.70,       // Người: 1.7m
+    'chair': 0.90,        // Ghế: 90cm
+    'couch': 0.85,        // Sofa: 85cm
+    'dining table': 0.75, // Bàn ăn: 75cm
+    'bottle': 0.23,       // Chai nước: 23cm
+    'cup': 0.12,          // Cốc nước: 12cm
+    'cell phone': 0.15,   // Điện thoại: 15cm
+    'laptop': 0.25,       // Laptop: 25cm
+    'refrigerator': 1.80, // Tủ lạnh: 1.8m
+    'door': 2.00,         // Cửa: 2m
+    'tv': 0.60,           // Tivi: 60cm
+    'dog': 0.45,          // Chó: 45cm
+    'cat': 0.25,          // Mèo: 25cm
+    'motorcycle': 1.05,   // Xe máy: 1.05m
+    'bicycle': 1.00,      // Xe đạp: 1m
+    'car': 1.50,          // Ô tô: 1.5m
+    'bus': 3.00,          // Xe buýt: 3m
+    'truck': 2.80,        // Xe tải: 2.8m
+  };
 
-    double meters = factor / ratio;
-    if (meters < 0.5) return "Rất gần (<0.5m) ⚠️";
-    return "~${meters.toStringAsFixed(1)}m";
+  String estimateDistance(double boxBottom, double boxHeight, double screenHeight, String label) {
+    // 1. Tính toán theo phương pháp Mặt đất (Ground Plane Projection)
+    const double cameraHeight = 1.3; // Chiều cao cầm máy trung bình
+    double pitchAngleRad = _currentPitchRad; // Góc nghiêng đọc từ accelerometer
+
+    const double verticalFov = 55.0; // Góc mở dọc camera
+    final double fovRad = verticalFov * math.pi / 180.0;
+    final double focalLength = screenHeight / (2.0 * math.tan(fovRad / 2.0));
+
+    double centerY = screenHeight / 2.0;
+    double yPixel = boxBottom - centerY;
+    double phiRad = math.atan(yPixel / focalLength);
+
+    double dGround = cameraHeight / math.tan(pitchAngleRad + phiRad);
+    if (dGround <= 0 || dGround.isNaN) {
+      dGround = 15.0; // Dự phòng nếu góc âm/vô tận
+    }
+
+    // 2. Tính toán theo phương pháp Tiêu cự (Focal Length) dựa trên kích thước nhãn
+    double realHeight = _realHeights[label] ?? 0.50;
+    double dFocal = (realHeight * focalLength) / boxHeight;
+    if (dFocal <= 0 || dFocal.isNaN) {
+      dFocal = 15.0;
+    }
+
+    // 3. Chọn khoảng cách nhỏ nhất để bảo vệ an toàn tối đa cho người khiếm thị
+    double finalMeters = math.min(dGround, dFocal);
+
+    if (finalMeters < 0.6) {
+      return "Rất gần (${finalMeters.toStringAsFixed(1)}m) ⚠️";
+    }
+    return "~${finalMeters.toStringAsFixed(1)}m";
   }
 
   @override
   void dispose() {
+    _accelSubscription?.cancel();
     _lightSensorSubscription?.cancel();
     controller.dispose();
     vision.closeYoloModel();
@@ -894,8 +953,9 @@ class _YoloScreenState extends State<YoloScreen> {
       double finalTop = y1 * scale + offsetY;
       double finalWidth = (x2 - x1) * scale;
       double finalHeight = (y2 - y1) * scale;
+      double finalBottom = finalTop + finalHeight;
 
-      String distance = estimateDistance(finalHeight, screen.height, tag);
+      String distance = estimateDistance(finalBottom, finalHeight, screen.height, tag);
       Color boxColor = distance.contains("Rất gần") ? Colors.redAccent : Colors.cyanAccent;
       String vnName = dictionary[tag] ?? tag;
 
