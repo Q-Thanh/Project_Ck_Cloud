@@ -13,6 +13,7 @@ import 'package:flutter_map/flutter_map.dart'; // Import bản đồ
 import 'package:latlong2/latlong.dart';       // Import tọa độ
 import 'package:sensors_plus/sensors_plus.dart'; // Import cảm biến gia tốc
 import 'dart:math' as math;                  // Import toán học
+import 'depth_anything_helper.dart';        // Import helper đo khoảng cách AI mới
 import 'admin_screen.dart';
 late List<CameraDescription> _cameras;
 
@@ -489,6 +490,7 @@ class _YoloScreenState extends State<YoloScreen> {
   StreamSubscription<int>? _lightSensorSubscription;
   double _currentPitchRad = 15.0 * math.pi / 180.0; // Mặc định 15 độ cúi xuống
   StreamSubscription<AccelerometerEvent>? _accelSubscription;
+  final DepthAnythingHelper _depthHelper = DepthAnythingHelper();
 
   bool isPaused = false;
   bool isEcoMode = false;
@@ -543,6 +545,7 @@ class _YoloScreenState extends State<YoloScreen> {
       numThreads: 2,
       useGpu: true,
     );
+    await _depthHelper.loadModel();
 
     setState(() {
       isLoaded = true;
@@ -652,12 +655,33 @@ class _YoloScreenState extends State<YoloScreen> {
 
     for (var result in results) {
       dynamic box = result["box"];
+      double normX1 = box[0];
+      double normY1 = box[1];
+      double normX2 = box[2];
+      double normY2 = box[3];
+      if (normX2 >= 2.0) {
+        normX1 /= imageWidth;
+        normX2 /= imageWidth;
+        normY1 /= imageHeight;
+        normY2 /= imageHeight;
+      }
+
       double y1 = box[1]; double y2 = box[3];
       if (box[2] < 2.0) { y1 *= imageHeight; y2 *= imageHeight; }
       
       double finalBottom = y2 * scaleY;
       double finalHeight = (y2 - y1) * scaleY;
-      String distText = estimateDistance(finalBottom, finalHeight, screen.height, result['tag']);
+      String distText = estimateDistance(
+        boxBottom: finalBottom,
+        boxHeight: finalHeight,
+        screenHeight: screen.height,
+        label: result['tag'],
+        x1: normX1,
+        y1: normY1,
+        x2: normX2,
+        y2: normY2,
+        image: cameraImage,
+      );
 
       if (distText.contains("Rất gần")) {
         priorityObj = result;
@@ -797,7 +821,17 @@ class _YoloScreenState extends State<YoloScreen> {
     'truck': 2.80,        // Xe tải: 2.8m
   };
 
-  String estimateDistance(double boxBottom, double boxHeight, double screenHeight, String label) {
+  String estimateDistance({
+    required double boxBottom,
+    required double boxHeight,
+    required double screenHeight,
+    required String label,
+    required double x1,
+    required double y1,
+    required double x2,
+    required double y2,
+    required CameraImage? image,
+  }) {
     // 1. Tính toán theo phương pháp Mặt đất (Ground Plane Projection)
     const double cameraHeight = 1.3; // Chiều cao cầm máy trung bình
     double pitchAngleRad = _currentPitchRad; // Góc nghiêng đọc từ accelerometer
@@ -815,15 +849,29 @@ class _YoloScreenState extends State<YoloScreen> {
       dGround = 15.0; // Dự phòng nếu góc âm/vô tận
     }
 
-    // 2. Tính toán theo phương pháp Tiêu cự (Focal Length) dựa trên kích thước nhãn
-    double realHeight = _realHeights[label] ?? 0.50;
-    double dFocal = (realHeight * focalLength) / boxHeight;
-    if (dFocal <= 0 || dFocal.isNaN) {
-      dFocal = 15.0;
-    }
+    double finalMeters;
 
-    // 3. Chọn khoảng cách nhỏ nhất để bảo vệ an toàn tối đa cho người khiếm thị
-    double finalMeters = math.min(dGround, dFocal);
+    // 2. Sử dụng mô hình AI Depth Anything V2 Small nếu đã tải xong
+    if (_depthHelper.isModelLoaded && image != null) {
+      double dDepth = _depthHelper.estimateBoxDepth(image, x1, y1, x2, y2);
+      if (dDepth > 0) {
+        // Lấy giá trị nhỏ nhất giữa phương pháp vật lý mặt đất và AI để bảo vệ an toàn tối đa
+        finalMeters = math.min(dGround, dDepth);
+      } else {
+        // Dự phòng bằng tiêu cự nhãn nếu tính toán AI gặp lỗi
+        double realHeight = _realHeights[label] ?? 0.50;
+        double dFocal = (realHeight * focalLength) / boxHeight;
+        finalMeters = math.min(dGround, dFocal);
+      }
+    } else {
+      // 3. Dự phòng bằng tiêu cự nhãn (Focal Length) khi mô hình AI chưa tải xong hoặc không khả dụng
+      double realHeight = _realHeights[label] ?? 0.50;
+      double dFocal = (realHeight * focalLength) / boxHeight;
+      if (dFocal <= 0 || dFocal.isNaN) {
+        dFocal = 15.0;
+      }
+      finalMeters = math.min(dGround, dFocal);
+    }
 
     if (finalMeters < 0.6) {
       return "Rất gần (${finalMeters.toStringAsFixed(1)}m) ⚠️";
@@ -833,6 +881,7 @@ class _YoloScreenState extends State<YoloScreen> {
 
   @override
   void dispose() {
+    _depthHelper.close();
     _accelSubscription?.cancel();
     _lightSensorSubscription?.cancel();
     controller.dispose();
@@ -943,6 +992,17 @@ class _YoloScreenState extends State<YoloScreen> {
 
     return yoloResults.map((result) {
       dynamic box = result["box"];
+      double normX1 = box[0];
+      double normY1 = box[1];
+      double normX2 = box[2];
+      double normY2 = box[3];
+      if (normX2 >= 2.0) {
+        normX1 /= imageWidth;
+        normX2 /= imageWidth;
+        normY1 /= imageHeight;
+        normY2 /= imageHeight;
+      }
+
       double x1 = box[0]; double y1 = box[1];
       double x2 = box[2]; double y2 = box[3];
       String tag = result['tag'];
@@ -955,7 +1015,17 @@ class _YoloScreenState extends State<YoloScreen> {
       double finalHeight = (y2 - y1) * scale;
       double finalBottom = finalTop + finalHeight;
 
-      String distance = estimateDistance(finalBottom, finalHeight, screen.height, tag);
+      String distance = estimateDistance(
+        boxBottom: finalBottom,
+        boxHeight: finalHeight,
+        screenHeight: screen.height,
+        label: tag,
+        x1: normX1,
+        y1: normY1,
+        x2: normX2,
+        y2: normY2,
+        image: cameraImage,
+      );
       Color boxColor = distance.contains("Rất gần") ? Colors.redAccent : Colors.cyanAccent;
       String vnName = dictionary[tag] ?? tag;
 
