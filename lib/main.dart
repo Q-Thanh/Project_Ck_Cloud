@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart'; // Để dùng HapticFeedback
@@ -11,8 +10,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter_map/flutter_map.dart'; // Import bản đồ
-import 'package:http/http.dart' as http;
-import 'package:image/image.dart' as img;
 import 'package:latlong2/latlong.dart';       // Import tọa độ
 import 'package:sensors_plus/sensors_plus.dart'; // Import cảm biến gia tốc
 import 'dart:math' as math;                  // Import toán học
@@ -509,20 +506,6 @@ class _YoloScreenState extends State<YoloScreen> {
   String lastSpokenTag = "";
   bool isSpeaking = false;
   DateTime lastDangerAlert = DateTime.now();
-  DateTime _lastLowConfidenceUpload = DateTime.fromMillisecondsSinceEpoch(0);
-  bool _isUploadingLowConfidenceFrame = false;
-  List<int>? _lastUploadedFrameFingerprint;
-
-  // Android emulator: http://10.0.2.2:8000
-  // Physical phone: replace with your computer LAN IP, e.g. http://192.168.1.10:8000
-  static const String _trainingBackendUrl = 'http://172.16.43.229:8000';
-  static const double _lowConfidenceMin = 0.25;
-  static const double _lowConfidenceMax = 0.60;
-  static const int _minLowConfidenceObjects = 3;
-  static const double _minFrameDifferenceRatio = 0.30;
-  static const int _frameFingerprintSize = 16;
-  static const Duration _lowConfidenceUploadInterval = Duration(seconds: 8);
-  static const bool _enableDepthEstimation = false;
 
   final Map<String, String> dictionary = {
     'person': 'Người', 'bicycle': 'Xe đạp', 'car': 'Ô tô', 'motorcycle': 'Xe máy',
@@ -562,11 +545,9 @@ class _YoloScreenState extends State<YoloScreen> {
       modelVersion: "yolov8",
       quantization: false,
       numThreads: 2,
-      useGpu: false,
+      useGpu: true,
     );
-    if (_enableDepthEstimation) {
-      await _depthHelper.loadModel();
-    }
+    await _depthHelper.loadModel();
 
     setState(() {
       isLoaded = true;
@@ -613,218 +594,78 @@ class _YoloScreenState extends State<YoloScreen> {
   }
 
   Future<void> yoloOnFrame(CameraImage cameraImage) async {
-    try {
-      this.cameraImage = cameraImage;
-      final result = await vision.yoloOnFrame(
-        bytesList: cameraImage.planes.map((plane) => plane.bytes).toList(),
-        imageHeight: cameraImage.height,
-        imageWidth: cameraImage.width,
-        iouThreshold: 0.4,
-        confThreshold: _lowConfidenceMin,
-        classThreshold: _lowConfidenceMin,
-      );
-      
-      if (mounted) {
-        screenSize = MediaQuery.of(context).size;
+    this.cameraImage = cameraImage;
+    final result = await vision.yoloOnFrame(
+      bytesList: cameraImage.planes.map((plane) => plane.bytes).toList(),
+      imageHeight: cameraImage.height,
+      imageWidth: cameraImage.width,
+      iouThreshold: 0.4,
+      confThreshold: 0.4,
+      classThreshold: 0.4,
+    );
+    
+    if (mounted) {
+      screenSize = MediaQuery.of(context).size;
 
-        // Chuyển sang dạng Map thay đổi được để gán tracker_id
-        final mutableResult = result.map((e) => Map<String, dynamic>.from(e)).toList();
-        tracker.update(mutableResult);
+      // Chuyển sang dạng Map thay đổi được để gán tracker_id
+      final mutableResult = result.map((e) => Map<String, dynamic>.from(e)).toList();
+      tracker.update(mutableResult);
 
-        final user = FirebaseAuth.instance.currentUser;
-        if (user != null && mutableResult.isNotEmpty) {
-          unawaited(_uploadLowConfidenceFrameIfNeeded(cameraImage, mutableResult, user.uid));
-          unawaited(_uploadTrackedHighConfidenceDetections(mutableResult, user.uid));
+      // --- PHẦN MỚI: GỬI DỮ LIỆU LÊN FIREBASE (CHỈ GỬI VẬT THỂ MỚI) ---
+      final user = FirebaseAuth.instance.currentUser;
+      if (user != null && mutableResult.isNotEmpty) {
+        Position? position;
+
+        for (var detection in mutableResult) {
+          double confidence = detection['box'][4] ?? 0.0;
+          if (confidence > 0.6) {
+            String? trackerId = detection['tracker_id'];
+            if (trackerId != null) {
+              var trackedObj = tracker.find(trackerId);
+              if (trackedObj != null && !trackedObj.isUploaded) {
+                // Lấy vị trí GPS một lần duy nhất trong frame nếu có vật thể mới cần gửi
+                position ??= await Geolocator.getCurrentPosition();
+                
+                FirebaseFirestore.instance.collection('detections').add({
+                  'user_id': user.uid,
+                  'detected_object': detection['tag'],     // Tên vật cản
+                  'confidence_score': confidence,          // Độ tự tin
+                  'latitude': position.latitude,           // Vĩ độ thật
+                  'longitude': position.longitude,         // Kinh độ thật
+                  'timestamp': FieldValue.serverTimestamp(),
+                });
+                
+                trackedObj.isUploaded = true;
+              }
+            }
+          }
         }
-        if (mutableResult.isEmpty) lastSpokenTag = ""; 
+      }
+      if (mutableResult.isEmpty) lastSpokenTag = ""; 
 
-        setState(() {
-          yoloResults = mutableResult;
-          for (var detection in mutableResult) {
-             double confidence = detection['box'][4] ?? 0.0;
-             if (confidence > 0.6) {
-               String? trackerId = detection['tracker_id'];
-               if (trackerId != null) {
-                 var trackedObj = tracker.find(trackerId);
-                 if (trackedObj != null && !trackedObj.isAddedToHistory) {
-                   detectionHistory.insert(0, {'tag': detection['tag'], 'timestamp': DateTime.now()});
-                   trackedObj.isAddedToHistory = true;
-                   if (detectionHistory.length > 50) detectionHistory.removeLast();
-                 }
+      setState(() {
+        yoloResults = mutableResult;
+        for (var detection in mutableResult) {
+           double confidence = detection['box'][4] ?? 0.0;
+           if (confidence > 0.6) {
+             String? trackerId = detection['tracker_id'];
+             if (trackerId != null) {
+               var trackedObj = tracker.find(trackerId);
+               if (trackedObj != null && !trackedObj.isAddedToHistory) {
+                 detectionHistory.insert(0, {'tag': detection['tag'], 'timestamp': DateTime.now()});
+                 trackedObj.isAddedToHistory = true;
+                 if (detectionHistory.length > 50) detectionHistory.removeLast();
                }
              }
-          }
-        });
-
-        if (screenSize != null) {
-          processVoiceSmart(mutableResult, screenSize!);
+           }
         }
-      }
-    } catch (e) {
-      debugPrint('Lỗi YOLO frame: $e');
-    } finally {
-      isDetecting = false;
-    }
-  }
-
-  Future<void> _uploadTrackedHighConfidenceDetections(
-    List<Map<String, dynamic>> detections,
-    String userId,
-  ) async {
-    Position? position;
-
-    for (var detection in detections) {
-      double confidence = detection['box'][4] ?? 0.0;
-      if (confidence <= 0.6) continue;
-
-      String? trackerId = detection['tracker_id'];
-      if (trackerId == null) continue;
-
-      var trackedObj = tracker.find(trackerId);
-      if (trackedObj == null || trackedObj.isUploaded) continue;
-
-      position ??= await Geolocator.getCurrentPosition().timeout(
-        const Duration(seconds: 3),
-      );
-
-      await FirebaseFirestore.instance.collection('detections').add({
-        'user_id': userId,
-        'detected_object': detection['tag'],
-        'confidence_score': confidence,
-        'latitude': position.latitude,
-        'longitude': position.longitude,
-        'timestamp': FieldValue.serverTimestamp(),
+        isDetecting = false;
       });
 
-      trackedObj.isUploaded = true;
-    }
-  }
-
-  Future<void> _uploadLowConfidenceFrameIfNeeded(
-    CameraImage image,
-    List<Map<String, dynamic>> detections,
-    String userId,
-  ) async {
-    if (_isUploadingLowConfidenceFrame) return;
-
-    final now = DateTime.now();
-    if (now.difference(_lastLowConfidenceUpload) < _lowConfidenceUploadInterval) {
-      return;
-    }
-
-    final lowConfidenceDetections = detections.where((detection) {
-      final confidence = ((detection['box'][4] ?? 0.0) as num).toDouble();
-      return confidence >= _lowConfidenceMin && confidence < _lowConfidenceMax;
-    }).toList();
-
-    if (lowConfidenceDetections.length < _minLowConfidenceObjects) return;
-
-    final frameFingerprint = _buildFrameFingerprint(image);
-    final differenceRatio = _calculateFrameDifferenceRatio(
-      frameFingerprint,
-      _lastUploadedFrameFingerprint,
-    );
-
-    if (differenceRatio < _minFrameDifferenceRatio) return;
-
-    _isUploadingLowConfidenceFrame = true;
-    _lastLowConfidenceUpload = now;
-
-    try {
-      final jpegBytes = _convertYuv420ToJpeg(image);
-      final uri = Uri.parse('$_trainingBackendUrl/api/frames/low-confidence');
-      final request = http.MultipartRequest('POST', uri)
-        ..fields['user_id'] = userId
-        ..fields['model_version'] = 'yolov8n_v1'
-        ..fields['created_at'] = now.toIso8601String()
-        ..fields['image_width'] = image.width.toString()
-        ..fields['image_height'] = image.height.toString()
-        ..fields['detections'] = jsonEncode(lowConfidenceDetections.map((detection) {
-          return {
-            'tag': detection['tag'],
-            'confidence': detection['box'][4],
-            'box': detection['box'],
-          };
-        }).toList())
-        ..files.add(
-          http.MultipartFile.fromBytes(
-            'image',
-            jpegBytes,
-            filename: '${userId}_${now.millisecondsSinceEpoch}.jpg',
-          ),
-        );
-
-      final response = await request.send().timeout(const Duration(seconds: 10));
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        debugPrint('Backend từ chối frame confidence thấp: ${response.statusCode}');
-      } else {
-        _lastUploadedFrameFingerprint = frameFingerprint;
-      }
-    } catch (e) {
-      debugPrint('Lỗi gửi frame confidence thấp về backend: $e');
-    } finally {
-      _isUploadingLowConfidenceFrame = false;
-    }
-  }
-
-  List<int> _buildFrameFingerprint(CameraImage image) {
-    final yPlane = image.planes[0];
-    final width = image.width;
-    final height = image.height;
-    final sampleStepX = (width / _frameFingerprintSize).floor().clamp(1, width);
-    final sampleStepY = (height / _frameFingerprintSize).floor().clamp(1, height);
-    final fingerprint = <int>[];
-
-    for (int gy = 0; gy < _frameFingerprintSize; gy++) {
-      final y = (gy * sampleStepY).clamp(0, height - 1);
-      for (int gx = 0; gx < _frameFingerprintSize; gx++) {
-        final x = (gx * sampleStepX).clamp(0, width - 1);
-        fingerprint.add(yPlane.bytes[y * yPlane.bytesPerRow + x]);
+      if (screenSize != null) {
+        processVoiceSmart(mutableResult, screenSize!);
       }
     }
-
-    return fingerprint;
-  }
-
-  double _calculateFrameDifferenceRatio(List<int> current, List<int>? previous) {
-    if (previous == null || previous.length != current.length) return 1.0;
-
-    double totalDiff = 0;
-    for (int i = 0; i < current.length; i++) {
-      totalDiff += (current[i] - previous[i]).abs() / 255;
-    }
-
-    return totalDiff / current.length;
-  }
-
-  Uint8List _convertYuv420ToJpeg(CameraImage image) {
-    final width = image.width;
-    final height = image.height;
-    final out = img.Image(width: width, height: height);
-
-    final yPlane = image.planes[0];
-    final uPlane = image.planes[1];
-    final vPlane = image.planes[2];
-    final uvPixelStride = uPlane.bytesPerPixel ?? 1;
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        final yIndex = y * yPlane.bytesPerRow + x;
-        final uvIndex = (y ~/ 2) * uPlane.bytesPerRow + (x ~/ 2) * uvPixelStride;
-
-        final yp = yPlane.bytes[yIndex];
-        final up = uPlane.bytes[uvIndex];
-        final vp = vPlane.bytes[uvIndex];
-
-        final r = (yp + 1.402 * (vp - 128)).round().clamp(0, 255);
-        final g = (yp - 0.344136 * (up - 128) - 0.714136 * (vp - 128)).round().clamp(0, 255);
-        final b = (yp + 1.772 * (up - 128)).round().clamp(0, 255);
-
-        out.setPixelRgb(x, y, r, g, b);
-      }
-    }
-
-    return Uint8List.fromList(img.encodeJpg(out, quality: 75));
   }
 
   Future<void> processVoiceSmart(List<Map<String, dynamic>> results, Size screen) async {
