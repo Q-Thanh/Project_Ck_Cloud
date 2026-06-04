@@ -19,6 +19,7 @@ import 'dart:math' as math;                  // Import toán học
 import 'depth_anything_helper.dart';        // Import helper đo khoảng cách AI mới
 import 'admin_screen.dart';
 import 'object_tracker.dart';
+import 'safety_dashboard.dart';
 late List<CameraDescription> _cameras;
 
 Future<void> main() async {
@@ -672,6 +673,7 @@ class _YoloScreenState extends State<YoloScreen> {
     String userId,
   ) async {
     Position? position;
+    List<String> newLabels = [];
 
     for (var detection in detections) {
       double confidence = detection['box'][4] ?? 0.0;
@@ -697,6 +699,20 @@ class _YoloScreenState extends State<YoloScreen> {
       });
 
       trackedObj.isUploaded = true;
+      newLabels.add(detection['tag']);
+    }
+
+    // Đồng bộ chuỗi dữ liệu gồm [Thời gian, Tọa độ, Số lượng vật thể, Nhãn] lên Cloud
+    if (newLabels.isNotEmpty && position != null) {
+      await FirebaseFirestore.instance.collection('safety_records').add({
+        'user_id': userId,
+        'timestamp': FieldValue.serverTimestamp(),
+        'latitude': position.latitude,
+        'longitude': position.longitude,
+        'object_count': newLabels.length,
+        'labels': newLabels,
+      });
+      debugPrint("☁️ Đã đồng bộ Safety Record lên Cloud: ${newLabels.length} vật thể: $newLabels");
     }
   }
 
@@ -1301,7 +1317,15 @@ class _YoloScreenState extends State<YoloScreen> {
         },
         'status': 'online', // Đánh dấu đang online
       });
-      print("📍 Đã cập nhật vị trí: ${position.latitude}, ${position.longitude}");
+
+      // Đồng bộ lịch sử vị trí lên Cloud
+      FirebaseFirestore.instance.collection('location_history').add({
+        'user_id': user.uid,
+        'latitude': position.latitude,
+        'longitude': position.longitude,
+        'timestamp': FieldValue.serverTimestamp(),
+      });
+      debugPrint("📍 Đã cập nhật vị trí và đồng bộ lịch sử: ${position.latitude}, ${position.longitude}");
     });
   }
 }
@@ -1321,6 +1345,7 @@ class _TrackingScreenState extends State<TrackingScreen> {
   final MapController _mapController = MapController();
   LatLng? _currentLocation; 
   bool _isFirstLoad = true;
+  String? _targetUserId; // Lưu ID người dùng để mở Dashboard
 
   @override
   Widget build(BuildContext context) {
@@ -1328,6 +1353,24 @@ class _TrackingScreenState extends State<TrackingScreen> {
       appBar: AppBar(
         title: Text("Đang theo dõi: ${widget.targetName}"),
         backgroundColor: Colors.blue[900],
+        actions: [
+          if (_targetUserId != null)
+            IconButton(
+              icon: const Icon(Icons.analytics_outlined, color: Colors.cyanAccent),
+              tooltip: "Dashboard an toàn",
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (context) => SafetyDashboardScreen(
+                      targetUserId: _targetUserId!,
+                      targetName: widget.targetName,
+                    ),
+                  ),
+                );
+              },
+            ),
+        ],
       ),
       // Dùng StreamBuilder truy vấn chuẩn vào bảng 'users' của bạn
       body: StreamBuilder<QuerySnapshot>(
@@ -1353,7 +1396,19 @@ class _TrackingScreenState extends State<TrackingScreen> {
           }
 
           // Lấy dữ liệu từ Firebase
-          var data = snapshot.data!.docs.first.data() as Map<String, dynamic>;
+          var doc = snapshot.data!.docs.first;
+          var data = doc.data() as Map<String, dynamic>;
+          String targetUserId = doc.id;
+
+          if (_targetUserId != targetUserId) {
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                setState(() {
+                  _targetUserId = targetUserId;
+                });
+              }
+            });
+          }
           
           if (data['location'] == null) {
              return const Center(
